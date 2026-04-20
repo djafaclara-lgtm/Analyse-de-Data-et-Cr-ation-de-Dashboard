@@ -1,0 +1,648 @@
+"""
+DataLens — Analyse de données automatique
+Version Python · Streamlit + Pandas + Plotly + Anthropic
+
+Lancement : streamlit run datalens_app.py
+Dépendances : pip install streamlit pandas plotly openpyxl anthropic requests
+"""
+
+import io
+import json
+import math
+import anthropic
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from datetime import datetime
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="DataLens — Analyse de données",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+PALETTE = [
+    "#6366f1", "#10b981", "#f59e0b", "#ef4444",
+    "#8b5cf6", "#06b6d4", "#ec4899", "#14b8a6",
+    "#f97316", "#84cc16",
+]
+
+ACCENT = "#6366f1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS GLOBAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+}
+
+/* ── Header ── */
+.dl-header {
+    background: #1e1b4b;
+    padding: 18px 28px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.25);
+}
+.dl-title {
+    color: #fff;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -.02em;
+}
+.dl-subtitle {
+    color: rgba(255,255,255,.45);
+    font-size: 12px;
+    margin-top: 3px;
+}
+
+/* ── Meta cards ── */
+.meta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+.meta-card {
+    background: #fff;
+    border: 1px solid rgba(0,0,0,.09);
+    border-radius: 10px;
+    padding: 12px 20px;
+    text-align: center;
+    min-width: 90px;
+}
+.meta-val { font-size: 24px; font-weight: 700; }
+.meta-lbl { font-size: 11px; color: #6b7280; margin-top: 3px; }
+
+/* ── KPI cards ── */
+.kpi-card {
+    background: #fff;
+    border: 1px solid rgba(0,0,0,.09);
+    border-radius: 10px;
+    padding: 14px 18px;
+    border-left: 4px solid var(--col);
+    margin-bottom: 8px;
+}
+.kpi-name { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: .07em; margin-bottom: 4px; }
+.kpi-val  { font-size: 26px; font-weight: 700; color: var(--col); line-height: 1; }
+.kpi-sub  { font-size: 12px; color: #9ca3af; margin-top: 6px; }
+
+/* ── Anom banner ── */
+.anom-banner {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 9px;
+    padding: 12px 18px;
+    color: #b91c1c;
+    font-weight: 500;
+    font-size: 14px;
+    margin-bottom: 16px;
+}
+
+/* ── AI box ── */
+.ai-box {
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 11px;
+    padding: 22px 26px;
+    line-height: 1.85;
+    font-size: 14.5px;
+    color: #1e1b4b;
+    margin-top: 18px;
+}
+.ai-box strong { display: block; margin-bottom: 10px; color: #6366f1; font-size: 15px; }
+
+/* ── Misc ── */
+.footer {
+    text-align: center;
+    color: #9ca3af;
+    font-size: 12px;
+    padding: 18px 0;
+    border-top: 1px solid #e5e7eb;
+    margin-top: 32px;
+}
+div[data-testid="stTabs"] button { font-family: 'IBM Plex Sans', sans-serif; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FONCTIONS UTILITAIRES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fr(v, d=2):
+    """Formate un nombre (fallback si None)."""
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v:,.{d}f}".replace(",", "\u202f").replace(".", ",")
+
+
+def detect_types(df: pd.DataFrame) -> dict[str, str]:
+    """Retourne un dict {col: 'number'|'text'} avec détection heuristique."""
+    types = {}
+    for col in df.columns:
+        converted = pd.to_numeric(df[col].dropna().astype(str)
+                                  .str.replace(r"\s", "", regex=True)
+                                  .str.replace(",", "."), errors="coerce")
+        ratio = converted.notna().sum() / max(len(converted), 1)
+        types[col] = "number" if ratio > 0.85 else "text"
+    return types
+
+
+def compute_stats(df: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+    """DataFrame de statistiques descriptives pour les colonnes numériques."""
+    rows = []
+    for col in num_cols:
+        s = df[col].dropna()
+        if s.empty:
+            continue
+        rows.append({
+            "Colonne":    col,
+            "Moyenne":    s.mean(),
+            "Médiane":    s.median(),
+            "Écart-type": s.std(),
+            "Min":        s.min(),
+            "Max":        s.max(),
+            "Q1":         s.quantile(0.25),
+            "Q3":         s.quantile(0.75),
+            "IQR":        s.quantile(0.75) - s.quantile(0.25),
+            "Skewness":   s.skew(),
+            "N":          len(s),
+        })
+    return pd.DataFrame(rows)
+
+
+def detect_anomalies(df: pd.DataFrame, num_cols: list[str]) -> pd.Series:
+    """Retourne un masque booléen des lignes aberrantes (méthode IQR × 1.5)."""
+    mask = pd.Series(False, index=df.index)
+    for col in num_cols:
+        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+        iqr = q3 - q1
+        out = (df[col] < q1 - 1.5 * iqr) | (df[col] > q3 + 1.5 * iqr)
+        mask |= out.fillna(False)
+    return mask
+
+
+def pearson_matrix(df: pd.DataFrame, num_cols: list[str]) -> pd.DataFrame:
+    """Matrice de corrélation de Pearson."""
+    return df[num_cols].corr(method="pearson")
+
+
+def export_excel(df: pd.DataFrame, stats: pd.DataFrame,
+                 corr: pd.DataFrame, anom_df: pd.DataFrame) -> bytes:
+    """Génère le fichier Excel multi-feuilles en mémoire."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # Synthèse
+        synth = pd.DataFrame({
+            "Métrique": [
+                "Généré le", "Lignes", "Colonnes",
+                "Colonnes numériques", "Colonnes catégorielles",
+                "Anomalies détectées (IQR)",
+            ],
+            "Valeur": [
+                datetime.now().strftime("%d/%m/%Y %H:%M"),
+                len(df), len(df.columns),
+                len(stats), len(df.columns) - len(stats),
+                len(anom_df),
+            ],
+        })
+        synth.to_excel(writer, sheet_name="Synthèse", index=False)
+        df.to_excel(writer, sheet_name="Données", index=False)
+        if not stats.empty:
+            stats.to_excel(writer, sheet_name="KPIs", index=False)
+        if corr is not None and not corr.empty:
+            corr.to_excel(writer, sheet_name="Corrélations")
+        if not anom_df.empty:
+            anom_df.to_excel(writer, sheet_name="Anomalies", index=False)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<div class="dl-header">
+  <div>
+    <div class="dl-title">🔍 DataLens</div>
+    <div class="dl-subtitle">Analyse automatique · Dashboard · Export Excel · Synthèse IA</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+uploaded = st.file_uploader(
+    "📂 Dépose ou sélectionne un fichier",
+    type=["csv", "tsv", "xlsx", "xls"],
+    help="Formats acceptés : CSV · TSV · Excel (.xlsx / .xls)",
+)
+
+if not uploaded:
+    st.info("⬆️ Importe un fichier CSV, TSV ou Excel pour commencer l'analyse.")
+    st.markdown('<div class="footer">🔍 DataLens — Aucune donnée envoyée à un serveur (sauf onglet IA)</div>',
+                unsafe_allow_html=True)
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner="Chargement et analyse…")
+def load_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    ext = filename.rsplit(".", 1)[-1].lower()
+    buf = io.BytesIO(file_bytes)
+    if ext == "csv":
+        # Essai auto-detect séparateur
+        sample = file_bytes[:4096].decode("utf-8", errors="replace")
+        sep = "\t" if sample.count("\t") > sample.count(";") else (
+              ";" if sample.count(";") > sample.count(",") else ",")
+        return pd.read_csv(buf, sep=sep, on_bad_lines="skip")
+    elif ext == "tsv":
+        return pd.read_csv(buf, sep="\t", on_bad_lines="skip")
+    else:
+        return pd.read_excel(buf)
+
+
+try:
+    raw_df = load_file(uploaded.read(), uploaded.name)
+except Exception as e:
+    st.error(f"❌ Erreur de lecture : {e}")
+    st.stop()
+
+if raw_df.empty:
+    st.error("❌ Le fichier est vide ou non lisible.")
+    st.stop()
+
+# Conversion des colonnes numériques détectées
+col_types = detect_types(raw_df)
+df = raw_df.copy()
+for col, t in col_types.items():
+    if t == "number":
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(r"\s", "", regex=True).str.replace(",", "."),
+            errors="coerce",
+        )
+
+num_cols = [c for c, t in col_types.items() if t == "number"]
+cat_cols = [c for c, t in col_types.items() if t == "text"]
+
+stats_df   = compute_stats(df, num_cols)
+anom_mask  = detect_anomalies(df, num_cols) if num_cols else pd.Series(False, index=df.index)
+anom_df    = df[anom_mask]
+corr_df    = pearson_matrix(df, num_cols) if len(num_cols) >= 2 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# META STRIP
+# ─────────────────────────────────────────────────────────────────────────────
+
+c1, c2, c3, c4, c5 = st.columns(5)
+metas = [
+    (c1, "Lignes",        len(df),          ACCENT,   ),
+    (c2, "Colonnes",      len(df.columns),  "#0891b2" ),
+    (c3, "Numériques",    len(num_cols),    "#059669" ),
+    (c4, "Catégorielles", len(cat_cols),    "#7c3aed" ),
+    (c5, "Anomalies",     len(anom_df),     "#dc2626" if len(anom_df) else "#059669"),
+]
+for col, lbl, val, color in metas:
+    col.markdown(f"""
+    <div class="meta-card">
+      <div class="meta-val" style="color:{color}">{val:,}</div>
+      <div class="meta-lbl">{lbl}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────────────
+
+tabs = st.tabs([
+    "🏁 KPIs",
+    "📊 Distributions",
+    "🔗 Corrélations",
+    "🗂️ Catégories",
+    f"⚠️ Anomalies ({len(anom_df)})",
+    "📋 Données",
+    "🤖 Analyse IA",
+])
+
+# ── 1. KPIs ──────────────────────────────────────────────────────────────────
+with tabs[0]:
+    if stats_df.empty:
+        st.info("Aucune colonne numérique détectée.")
+    else:
+        # KPI cards (grille 4 cols)
+        n_cols = min(4, len(stats_df))
+        grid = st.columns(n_cols)
+        for i, row in stats_df.iterrows():
+            color = PALETTE[i % len(PALETTE)]
+            with grid[i % n_cols]:
+                st.markdown(f"""
+                <div class="kpi-card" style="--col:{color}">
+                  <div class="kpi-name">{row['Colonne']}</div>
+                  <div class="kpi-val">{fr(row['Moyenne'])}</div>
+                  <div class="kpi-sub">σ = {fr(row['Écart-type'])} · méd. {fr(row['Médiane'])}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # Tableau de stats complet
+        display = stats_df.copy()
+        for col in display.columns:
+            if col not in ("Colonne", "N"):
+                display[col] = display[col].apply(lambda v: fr(v, 3))
+        st.dataframe(display.set_index("Colonne"), use_container_width=True)
+
+        # Export Excel
+        st.divider()
+        excel_bytes = export_excel(df, stats_df, corr_df, anom_df)
+        st.download_button(
+            label="⬇️ Exporter le rapport Excel",
+            data=excel_bytes,
+            file_name="datalens_rapport.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+
+# ── 2. Distributions ─────────────────────────────────────────────────────────
+with tabs[1]:
+    if not num_cols:
+        st.info("Aucune colonne numérique.")
+    else:
+        sel = st.selectbox("Colonne :", num_cols, key="dist_sel")
+        s = df[sel].dropna()
+
+        if not s.empty:
+            row = stats_df[stats_df["Colonne"] == sel].iloc[0]
+
+            # Mini stats
+            cols_s = st.columns(7)
+            labels = ["Moyenne", "Médiane", "Écart-type", "Min", "Max", "IQR", "Skewness"]
+            for c, lbl in zip(cols_s, labels):
+                c.metric(lbl, fr(row[lbl], 2))
+
+            st.divider()
+
+            # Histogramme Plotly
+            fig = px.histogram(
+                df, x=sel, nbins=25,
+                color_discrete_sequence=[ACCENT],
+                labels={sel: sel, "count": "Fréquence"},
+                title=f"Distribution — {sel}",
+            )
+            fig.update_layout(
+                plot_bgcolor="#fff",
+                paper_bgcolor="#fff",
+                font_family="IBM Plex Sans",
+                title_font_size=15,
+                bargap=0.04,
+            )
+            fig.update_traces(marker_line_width=0)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Boxplot
+            fig2 = px.box(
+                df, y=sel,
+                color_discrete_sequence=[ACCENT],
+                points="outliers",
+                title=f"Boxplot — {sel}",
+            )
+            fig2.update_layout(
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                font_family="IBM Plex Sans", title_font_size=15,
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+
+# ── 3. Corrélations ──────────────────────────────────────────────────────────
+with tabs[2]:
+    if len(num_cols) < 2:
+        st.info("Il faut au moins 2 colonnes numériques pour calculer les corrélations.")
+    else:
+        # Heatmap
+        fig = px.imshow(
+            corr_df,
+            color_continuous_scale=[[0, "#ef4444"], [0.5, "#f9fafb"], [1, ACCENT]],
+            zmin=-1, zmax=1,
+            text_auto=".2f",
+            title="Matrice de corrélations (Pearson)",
+            aspect="auto",
+        )
+        fig.update_layout(
+            font_family="IBM Plex Sans",
+            paper_bgcolor="#fff",
+            title_font_size=15,
+            coloraxis_colorbar_title="r",
+        )
+        fig.update_traces(textfont_size=11)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### Top corrélations")
+
+        # Paires triées par |r|
+        pairs = []
+        n = len(num_cols)
+        for i in range(n):
+            for j in range(i + 1, n):
+                pairs.append((num_cols[i], num_cols[j], corr_df.iloc[i, j]))
+        pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+
+        for a, b, r in pairs[:10]:
+            color = ACCENT if r >= 0 else "#ef4444"
+            sign  = "+" if r >= 0 else ""
+            bar   = abs(r) * 100
+            st.markdown(f"""
+            <div style="display:flex;align-items:center;gap:12px;background:#fff;
+                        border-radius:8px;padding:10px 14px;margin-bottom:6px;
+                        border:1px solid rgba(0,0,0,.07)">
+              <span style="flex:1;font-size:13px;font-weight:500;
+                           overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                {a} × {b}
+              </span>
+              <div style="width:100px;height:7px;background:#e5e7eb;border-radius:4px;flex-shrink:0">
+                <div style="width:{bar:.0f}%;height:100%;background:{color};border-radius:4px"></div>
+              </div>
+              <span style="font-weight:700;color:{color};min-width:54px;
+                           text-align:right;font-size:13px">
+                {sign}{r:.3f}
+              </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+# ── 4. Catégories ─────────────────────────────────────────────────────────────
+with tabs[3]:
+    if not cat_cols:
+        st.info("Aucune colonne catégorielle détectée.")
+    else:
+        sel_cat = st.selectbox("Colonne :", cat_cols, key="cat_sel")
+        freq = (
+            df[sel_cat].astype(str)
+            .value_counts()
+            .head(15)
+            .reset_index()
+            .rename(columns={"index": sel_cat, "count": "Occurrences"})
+        )
+        # Compat pandas ≥2.0
+        freq.columns = [sel_cat, "Occurrences"]
+
+        fig = px.bar(
+            freq, x="Occurrences", y=sel_cat,
+            orientation="h",
+            color=sel_cat,
+            color_discrete_sequence=PALETTE,
+            title=f"Fréquences — {sel_cat} (top 15)",
+        )
+        fig.update_layout(
+            showlegend=False,
+            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            font_family="IBM Plex Sans", title_font_size=15,
+            yaxis={"categoryorder": "total ascending"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 5. Anomalies ──────────────────────────────────────────────────────────────
+with tabs[4]:
+    if anom_df.empty:
+        st.success("✅ Aucune anomalie détectée — méthode IQR × 1.5 appliquée sur toutes les colonnes numériques.")
+    else:
+        st.markdown(f"""
+        <div class="anom-banner">
+          ⚠️ {len(anom_df)} ligne{"s" if len(anom_df)>1 else ""} anormale{"s" if len(anom_df)>1 else ""}
+          détectée{"s" if len(anom_df)>1 else ""} — méthode IQR ± 1.5
+        </div>
+        """, unsafe_allow_html=True)
+        st.dataframe(anom_df.head(200).reset_index(drop=True), use_container_width=True)
+
+        # Scatterplot anomalies si ≥2 colonnes numériques
+        if len(num_cols) >= 2:
+            st.divider()
+            c1, c2 = st.columns(2)
+            x_ax = c1.selectbox("Axe X :", num_cols, key="ax_x")
+            y_ax = c2.selectbox("Axe Y :", num_cols, index=min(1, len(num_cols)-1), key="ax_y")
+
+            plot_df = df[[x_ax, y_ax]].dropna().copy()
+            plot_df["type"] = "Normal"
+            plot_df.loc[anom_mask & plot_df.index.isin(plot_df.index), "type"] = "Anomalie"
+
+            fig = px.scatter(
+                plot_df, x=x_ax, y=y_ax, color="type",
+                color_discrete_map={"Normal": ACCENT, "Anomalie": "#ef4444"},
+                title=f"Anomalies — {x_ax} vs {y_ax}",
+                opacity=0.7,
+            )
+            fig.update_layout(
+                plot_bgcolor="#fff", paper_bgcolor="#fff",
+                font_family="IBM Plex Sans", title_font_size=15,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 6. Données brutes ─────────────────────────────────────────────────────────
+with tabs[5]:
+    st.caption(f"300 premières lignes affichées sur {len(df):,} au total")
+    st.dataframe(df.head(300), use_container_width=True, height=440)
+
+
+# ── 7. Analyse IA ─────────────────────────────────────────────────────────────
+with tabs[6]:
+    st.markdown("""
+    Génère une synthèse en langage naturel de tes données grâce à **Claude**.  
+    <span style="font-size:12px;color:#9ca3af">⚠️ Nécessite une clé API Anthropic valide.</span>
+    """, unsafe_allow_html=True)
+
+    api_key = st.text_input(
+        "Clé API Anthropic",
+        type="password",
+        placeholder="sk-ant-…",
+        help="Retrouve ta clé sur console.anthropic.com",
+    )
+
+    if st.button("🤖 Générer la synthèse IA", type="primary", disabled=not api_key):
+        # Construction du payload résumé
+        pairs_corr = []
+        if corr_df is not None:
+            nc = list(corr_df.columns)
+            for i in range(len(nc)):
+                for j in range(i + 1, len(nc)):
+                    pairs_corr.append({"a": nc[i], "b": nc[j], "r": round(float(corr_df.iloc[i, j]), 3)})
+            pairs_corr.sort(key=lambda x: abs(x["r"]), reverse=True)
+
+        payload = {
+            "rows":      len(df),
+            "cols":      len(df.columns),
+            "numCols":   num_cols,
+            "catCols":   cat_cols,
+            "anomalies": len(anom_df),
+            "kpis": [
+                {
+                    "col":  row["Colonne"],
+                    "mean": round(row["Moyenne"], 3),
+                    "std":  round(row["Écart-type"], 3),
+                    "min":  row["Min"],
+                    "max":  row["Max"],
+                    "skew": round(row["Skewness"], 3),
+                }
+                for _, row in stats_df.iterrows()
+            ],
+            "topCorr": pairs_corr[:5],
+        }
+
+        with st.spinner("⏳ Analyse en cours…"):
+            try:
+                client = anthropic.Anthropic(api_key=api_key)
+                message = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=1000,
+                    system=(
+                        "Tu es expert data analyst. Génère une synthèse concise (~8 phrases) "
+                        "en français : tendances clés, corrélations notables, anomalies, "
+                        "2-3 recommandations concrètes. Utilise les chiffres."
+                    ),
+                    messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                )
+                ai_text = message.content[0].text
+
+                st.markdown(f"""
+                <div class="ai-box">
+                  <strong>📊 Synthèse IA</strong>
+                  {ai_text}
+                </div>
+                """, unsafe_allow_html=True)
+
+            except anthropic.AuthenticationError:
+                st.error("❌ Clé API invalide. Vérifie ta clé sur console.anthropic.com.")
+            except Exception as e:
+                st.error(f"❌ Erreur : {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<div class="footer">
+  🔍 DataLens · Analyse locale — Aucune donnée envoyée à un serveur (sauf onglet IA)
+</div>
+""", unsafe_allow_html=True)
