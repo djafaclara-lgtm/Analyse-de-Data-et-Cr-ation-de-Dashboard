@@ -1,743 +1,404 @@
-# Analyse-de-Data-et-Cr-ation-de-Dashboard
-import numpy as np
-import pandas as pd
-import scipy.stats as stats
-
-
-def generate_analysis(
-    df: pd.DataFrame,
-    detect_anomalies: bool = True,
-    compute_corr: bool = True,
-    detect_trends: bool = True,
-    contamination: float = 0.05,
-) -> dict:
-    """Génère une analyse complète du DataFrame : stats, corrélations, anomalies, KPIs."""
-
-    results: dict = {}
-
-    num_cols  = df.select_dtypes(include="number").columns.tolist()
-    cat_cols  = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    date_cols = df.select_dtypes(include="datetime").columns.tolist()
-
-    results["num_cols"]  = num_cols
-    results["cat_cols"]  = cat_cols
-    results["date_cols"] = date_cols
-
-    # ── Statistiques descriptives ─────────────────────────────────────────────
-    if num_cols:
-        desc = df[num_cols].describe().T
-        desc["skewness"]  = df[num_cols].skew()
-        desc["kurtosis"]  = df[num_cols].kurt()
-        desc["nulls"]     = df[num_cols].isnull().sum()
-        desc["nulls_pct"] = (df[num_cols].isnull().sum() / len(df) * 100).round(2)
-        results["descriptive"] = desc
-
-    # ── KPIs par colonne numérique ────────────────────────────────────────────
-    kpis = {}
-    for col in num_cols:
-        s = df[col].dropna()
-        kpis[col] = {
-            "moyenne":      round(float(s.mean()), 4),
-            "médiane":      round(float(s.median()), 4),
-            "écart-type":   round(float(s.std()), 4),
-            "min":          round(float(s.min()), 4),
-            "max":          round(float(s.max()), 4),
-            "skewness":     round(float(stats.skew(s)), 4),
-            "kurtosis":     round(float(stats.kurtosis(s)), 4),
-            "q1":           round(float(s.quantile(0.25)), 4),
-            "q3":           round(float(s.quantile(0.75)), 4),
-            "iqr":          round(float(s.quantile(0.75) - s.quantile(0.25)), 4),
-        }
-    results["kpis"] = kpis
-
-    # ── Fréquences catégorielles ──────────────────────────────────────────────
-    cat_freq = {}
-    for col in cat_cols:
-        freq = df[col].value_counts().head(15)
-        cat_freq[col] = freq.reset_index().rename(
-            columns={"index": col, col: "count"}
-        )
-    results["cat_freq"] = cat_freq
-
-    # ── Matrice de corrélations ───────────────────────────────────────────────
-    if compute_corr and len(num_cols) >= 2:
-        corr = df[num_cols].corr(method="pearson")
-        results["corr_matrix"] = corr
-
-        # Top paires corrélées (hors diagonale)
-        mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
-        corr_vals = corr.where(mask).stack().reset_index()
-        corr_vals.columns = ["col_a", "col_b", "correlation"]
-        corr_vals["abs_corr"] = corr_vals["correlation"].abs()
-        results["top_correlations"] = (
-            corr_vals.nlargest(10, "abs_corr").reset_index(drop=True)
-        )
-
-    # ── Détection d'anomalies (Isolation Forest) ──────────────────────────────
-    results["anomaly_count"] = 0
-    results["anomaly_rows"]  = pd.DataFrame()
-
-    if detect_anomalies and num_cols and len(df) >= 20:
-        try:
-            from sklearn.ensemble import IsolationForest
-            from sklearn.preprocessing import RobustScaler
-
-            X = df[num_cols].fillna(df[num_cols].median())
-            X_scaled = RobustScaler().fit_transform(X)
-
-            iso = IsolationForest(
-                contamination=contamination,
-                random_state=42,
-                n_estimators=100
-            )
-            preds = iso.fit_predict(X_scaled)
-            scores = iso.score_samples(X_scaled)
-
-            df_tmp = df.copy()
-            df_tmp["_anomaly_flag"]  = preds
-            df_tmp["_anomaly_score"] = scores.round(4)
-
-            anomaly_df = df_tmp[df_tmp["_anomaly_flag"] == -1].drop(
-                "_anomaly_flag", axis=1
-            ).sort_values("_anomaly_score")
-
-            results["anomaly_count"] = len(anomaly_df)
-            results["anomaly_rows"]  = anomaly_df
-        except ImportError:
-            results["anomaly_count"] = -1  # sklearn non dispo
-
-    # ── Tendances temporelles ─────────────────────────────────────────────────
-    if detect_trends and date_cols and num_cols:
-        date_col = date_cols[0]
-        df_sorted = df[[date_col] + num_cols].sort_values(date_col).dropna(subset=[date_col])
-
-        # Resampling mensuel si assez de données
-        try:
-            df_ts = df_sorted.set_index(date_col)
-            df_monthly = df_ts[num_cols].resample("ME").mean().reset_index()
-            results["time_series"] = {
-                "date_col":  date_col,
-                "value_cols": num_cols,
-                "df_raw":    df_sorted,
-                "df_monthly": df_monthly,
-            }
-        except Exception:
-            results["time_series"] = {
-                "date_col":   date_col,
-                "value_cols": num_cols,
-                "df_raw":     df_sorted,
-                "df_monthly": df_sorted,
-            }
-
-    return results
-    import streamlit as st
-from data_loader import smart_load, clean_dataframe
-from analyzer import generate_analysis
-from dashboard import render_dashboard
-from exporter import export_to_excel
-
-st.set_page_config(
-    page_title="DataLens",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# CSS personnalisé
-st.markdown("""
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>🔍 DataLens — Analyse de données</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
 <style>
-    .main-title { font-size: 2.2rem; font-weight: 700; color: #4F46E5; }
-    .subtitle   { font-size: 1rem; color: #6B7280; margin-top: -10px; }
-    .kpi-card   { background: #F9FAFB; border-radius: 10px; padding: 16px;
-                  border-left: 4px solid #4F46E5; }
-    .section-title { font-size: 1.1rem; font-weight: 600; color: #374151;
-                     margin: 24px 0 8px; }
-    div[data-testid="metric-container"] {
-        background: #F9FAFB; border-radius: 10px; padding: 12px;
-        border: 1px solid #E5E7EB;
-    }
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,sans-serif;background:#f8f9fc;color:#111;min-height:100vh}
+select,button,input{font-family:inherit}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:#c7d2fe;border-radius:3px}
+::-webkit-scrollbar-track{background:transparent}
+.tab-btn{background:none;border:none;cursor:pointer;padding:9px 14px;font-size:13px;white-space:nowrap;transition:all .12s;border-bottom:2.5px solid transparent;color:#6b7280}
+.tab-btn.active{font-weight:600;color:#6366f1;border-bottom-color:#6366f1}
+.card{background:#fff;border:1px solid rgba(0,0,0,.09);border-radius:11px;padding:13px 15px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.meta-card{background:#fff;border:1px solid rgba(0,0,0,.09);border-radius:10px;padding:9px 16px;text-align:center;min-width:80px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{padding:9px 12px;text-align:left;font-weight:500;white-space:nowrap;background:#1e1b4b;color:#fff}
+td{padding:7px 12px;border-bottom:1px solid rgba(0,0,0,.07);white-space:nowrap}
+tr:nth-child(even) td{background:#f9fafb}
+.upload-zone{border:2px dashed rgba(0,0,0,.2);border-radius:16px;padding:72px 24px;text-align:center;cursor:pointer;transition:all .18s;background:#fff}
+.upload-zone.drag,.upload-zone:hover{border-color:#6366f1;background:#eef2ff}
+.btn-primary{background:#6366f1;color:#fff;border:none;border-radius:9px;padding:10px 22px;cursor:pointer;font-size:13.5px;font-weight:600;transition:opacity .15s}
+.btn-primary:hover{opacity:.88}
+.btn-primary:disabled{opacity:.55;cursor:not-allowed}
+.btn-green{background:#10b981;color:#fff;border:none;border-radius:8px;padding:7px 15px;cursor:pointer;font-size:13px;font-weight:600;transition:opacity .15s}
+.btn-green:hover{opacity:.88}
+.btn-ghost{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:7px 15px;cursor:pointer;font-size:13px;font-weight:500;transition:all .15s}
+.btn-ghost:hover{background:rgba(255,255,255,.2)}
+select.std{padding:6px 12px;border-radius:8px;border:1px solid rgba(0,0,0,.18);background:#fff;font-size:13px;color:#111;cursor:pointer}
+.anom-banner{background:#fef2f2;border:1px solid #fecaca;border-radius:9px;padding:12px 16px;color:#b91c1c;font-weight:500;font-size:13.5px;margin-bottom:14px}
+.ai-box{background:#eef2ff;border:1px solid #c7d2fe;border-radius:11px;padding:20px 24px;line-height:1.85;font-size:14px;color:#1e1b4b;white-space:pre-wrap}
+.corr-row{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid rgba(0,0,0,.07);border-radius:8px;padding:10px 14px;margin-bottom:6px}
+.corr-bar-track{width:90px;height:6px;background:rgba(0,0,0,.1);border-radius:4px;flex-shrink:0;overflow:hidden}
+.stat-chip{background:#f3f4f6;border-radius:8px;padding:10px 14px;text-align:center}
+.section-title{font-size:14px;font-weight:600;margin-bottom:12px;color:#374151}
 </style>
-""", unsafe_allow_html=True)
-
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/combo-chart.png", width=60)
-    st.markdown("## 🔍 DataLens")
-    st.markdown("Analyse automatique de données")
-    st.divider()
-
-    st.markdown("### ⚙️ Options d'analyse")
-    detect_anomalies  = st.toggle("Détection d'anomalies", value=True)
-    compute_corr      = st.toggle("Matrice de corrélations", value=True)
-    detect_trends     = st.toggle("Tendances temporelles", value=True)
-    contamination_pct = st.slider("Seuil anomalies (%)", 1, 20, 5) / 100
-
-    st.divider()
-    st.markdown("### 📤 Export")
-    max_chart_sheets = st.slider("Feuilles graphiques max", 1, 10, 5)
-
-    st.divider()
-    st.caption("DataLens v1.0 · Propulsé par Streamlit")
-
-# ── Header ───────────────────────────────────────────────────────────────────
-st.markdown('<p class="main-title">🔍 DataLens</p>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Import · Analyse · Dashboard · Export Excel</p>',
-            unsafe_allow_html=True)
-st.divider()
-
-# ── Upload ───────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader(
-    "📂 Dépose ton fichier ici",
-    type=["csv", "tsv", "xlsx", "xls", "json", "parquet"],
-    help="Formats supportés : CSV, TSV, Excel (.xlsx/.xls), JSON, Parquet"
-)
-
-if uploaded is None:
-    st.info("👆 Importe un fichier pour démarrer l'analyse automatique.", icon="💡")
-    with st.expander("ℹ️ Fonctionnalités disponibles"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("**📊 Analyse**")
-            st.markdown("- Statistiques descriptives\n- Corrélations\n- Anomalies\n- Tendances\n- KPIs auto")
-        with col2:
-            st.markdown("**📈 Visualisations**")
-            st.markdown("- Histogrammes\n- Heatmap\n- Courbes\n- Boxplots\n- KPI cards")
-        with col3:
-            st.markdown("**📤 Export**")
-            st.markdown("- Excel multi-feuilles\n- Graphiques natifs\n- Synthèse exécutive\n- Données nettoyées\n- Rapport de corrélations")
-    st.stop()
-
-# ── Chargement ───────────────────────────────────────────────────────────────
-with st.spinner("⏳ Chargement et détection des types…"):
-    df = smart_load(uploaded)
-
-if df is None:
-    st.stop()
-
-with st.spinner("🧹 Nettoyage des données…"):
-    df, clean_report = clean_dataframe(df)
-
-# Métriques rapides
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("📋 Lignes",    f"{len(df):,}")
-c2.metric("📐 Colonnes",  f"{len(df.columns)}")
-c3.metric("🗑️ Doublons supprimés", clean_report.get("doublons_supprimés", 0))
-nulls = sum(v for v in clean_report.get("valeurs_nulles", {}).values())
-c4.metric("🔧 Valeurs nulles traitées", nulls)
-
-with st.expander("📋 Rapport de nettoyage détaillé"):
-    st.json(clean_report)
-    st.dataframe(df.head(10), use_container_width=True)
-
-st.divider()
-
-# ── Analyse ───────────────────────────────────────────────────────────────────
-with st.spinner("🔬 Analyse statistique en cours…"):
-    analysis = generate_analysis(
-        df,
-        detect_anomalies=detect_anomalies,
-        compute_corr=compute_corr,
-        detect_trends=detect_trends,
-        contamination=contamination_pct
-    )
-
-# ── Dashboard ─────────────────────────────────────────────────────────────────
-render_dashboard(df, analysis)
-
-st.divider()
-
-# ── Export ────────────────────────────────────────────────────────────────────
-st.markdown('<p class="section-title">📤 Exporter le rapport</p>',
-            unsafe_allow_html=True)
-
-with st.spinner("📊 Génération du fichier Excel…"):
-    excel_bytes = export_to_excel(df, analysis, max_charts=max_chart_sheets)
-
-st.download_button(
-    label="⬇️ Télécharger le rapport Excel complet",
-    data=excel_bytes,
-    file_name=f"datalens_rapport_{uploaded.name.split('.')[0]}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-    type="primary"
-)
-import pandas as pd
-import streamlit as st
-from pathlib import Path
-
-SUPPORTED_FORMATS = {
-    ".csv":     lambda f, **kw: pd.read_csv(f, **kw),
-    ".tsv":     lambda f, **kw: pd.read_csv(f, sep="\t", **kw),
-    ".xlsx":    lambda f, **kw: pd.read_excel(f, **kw),
-    ".xls":     lambda f, **kw: pd.read_excel(f, **kw),
-    ".json":    lambda f, **kw: pd.read_json(f, **kw),
-    ".parquet": lambda f, **kw: pd.read_parquet(f, **kw),
+</head>
+<body>
+<div id="root"></div>
+<script>
+const {createElement:h,useState,useRef,useCallback}=React
+const {BarChart,Bar,XAxis,YAxis,CartesianGrid,Tooltip,ResponsiveContainer,Cell}=Recharts
+const PAL=['#6366f1','#10b981','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#14b8a6','#f97316','#84cc16']
+const IND='#6366f1'
+ 
+const fmtN=(v,d=3)=>v==null?'—':(+v).toLocaleString('fr-FR',{maximumFractionDigits:d,minimumFractionDigits:d})
+ 
+function calcStats(vals){
+  const nums=vals.filter(v=>typeof v==='number'&&isFinite(v))
+  if(!nums.length)return null
+  const s=[...nums].sort((a,b)=>a-b),n=nums.length
+  const mean=nums.reduce((a,v)=>a+v,0)/n
+  const med=n%2?s[Math.floor(n/2)]:(s[n/2-1]+s[n/2])/2
+  const std=Math.sqrt(nums.reduce((a,v)=>a+(v-mean)**2,0)/n)
+  const q1=s[Math.floor(n*.25)],q3=s[Math.floor(n*.75)],iqr=q3-q1
+  const skew=std?nums.reduce((a,v)=>a+((v-mean)/std)**3,0)/n:0
+  return{mean,med,std,min:s[0],max:s[n-1],q1,q3,iqr,skew,n}
 }
-
-
-def smart_load(uploaded_file) -> pd.DataFrame | None:
-    """Charge un fichier uploadé et détecte automatiquement les types de colonnes."""
-    ext = Path(uploaded_file.name).suffix.lower()
-
-    if ext not in SUPPORTED_FORMATS:
-        st.error(f"❌ Format « {ext} » non supporté. "
-                 f"Formats acceptés : {', '.join(SUPPORTED_FORMATS)}")
-        return None
-
-    try:
-        df = SUPPORTED_FORMATS[ext](uploaded_file)
-    except Exception as e:
-        st.error(f"❌ Erreur lors du chargement : {e}")
-        return None
-
-    if df.empty:
-        st.warning("⚠️ Le fichier est vide ou ne contient pas de données lisibles.")
-        return None
-
-    # Nettoyage préliminaire des noms de colonnes
-    df.columns = df.columns.astype(str).str.strip()
-
-    # Détection intelligente des types colonne par colonne
-    for col in df.columns:
-        if df[col].dtype != object:
-            continue
-
-        # 1) Tentative datetime
-        try:
-            converted = pd.to_datetime(df[col], infer_datetime_format=True, errors="raise")
-            df[col] = converted
-            continue
-        except (ValueError, TypeError, OverflowError):
-            pass
-
-        # 2) Tentative numérique (gère "1 000,50" → 1000.50)
-        cleaned = (
-            df[col].astype(str)
-            .str.strip()
-            .str.replace(r"\s", "", regex=True)   # espaces (séparateurs milliers)
-            .str.replace(",", ".", regex=False)    # virgule décimale FR
-        )
-        try:
-            numeric = pd.to_numeric(cleaned, errors="raise")
-            df[col] = numeric
-        except (ValueError, TypeError):
-            pass  # reste en object (catégorielle / texte)
-
-    return df
-
-
-def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Nettoie le DataFrame et retourne un rapport de nettoyage."""
-    report: dict = {}
-    df = df.copy()
-
-    # 1. Suppression des colonnes entièrement vides
-    empty_cols = df.columns[df.isnull().all()].tolist()
-    df.drop(columns=empty_cols, inplace=True)
-    report["colonnes_vides_supprimées"] = empty_cols
-
-    # 2. Suppression des doublons
-    before = len(df)
-    df.drop_duplicates(inplace=True)
-    report["doublons_supprimés"] = before - len(df)
-
-    # 3. Rapport valeurs nulles (avant imputation)
-    nulls = df.isnull().sum()
-    report["valeurs_nulles"] = nulls[nulls > 0].to_dict()
-
-    # 4. Imputation
-    for col in df.select_dtypes(include="number").columns:
-        if df[col].isnull().any():
-            df[col].fillna(df[col].median(), inplace=True)
-
-    for col in df.select_dtypes(include=["object", "category"]).columns:
-        if df[col].isnull().any():
-            mode = df[col].mode()
-            df[col].fillna(mode[0] if not mode.empty else "N/A", inplace=True)
-
-    for col in df.select_dtypes(include="datetime").columns:
-        if df[col].isnull().any():
-            df[col].fillna(method="ffill", inplace=True)
-
-    # 5. Normalisation des noms de colonnes (snake_case)
-    df.columns = [
-        c.strip().lower()
-         .replace(" ", "_")
-         .replace("-", "_")
-         .replace("(", "")
-         .replace(")", "")
-        for c in df.columns
-    ]
-
-    report["nb_lignes_final"]    = len(df)
-    report["nb_colonnes_final"]  = len(df.columns)
-    report["types_détectés"]     = df.dtypes.astype(str).to_dict()
-
-    return df, report
-import io
-from datetime import datetime
-
-import numpy as np
-import openpyxl
-import pandas as pd
-from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.chart.series import DataPoint
-from openpyxl.styles import (Alignment, Border, Font, GradientFill,
-                              PatternFill, Side)
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.dataframe import dataframe_to_rows
-
-# ── Constantes de style ───────────────────────────────────────────────────────
-INDIGO     = "4F46E5"
-INDIGO_LT  = "EEF2FF"
-GRAY       = "F3F4F6"
-GRAY_DARK  = "6B7280"
-WHITE      = "FFFFFF"
-RED        = "EF4444"
-GREEN      = "22C55E"
-ORANGE     = "F97316"
-
-FONT_MAIN  = "Calibri"
-
-
-def _font(bold=False, size=11, color=None):
-    return Font(name=FONT_MAIN, bold=bold, size=size,
-                color=color or "000000")
-
-def _fill(hex_color):
-    return PatternFill("solid", fgColor=hex_color)
-
-def _align(h="center", v="center", wrap=False):
-    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
-
-def _border(sides="all", style="thin"):
-    side = Side(style=style)
-    if sides == "all":
-        return Border(left=side, right=side, top=side, bottom=side)
-    if sides == "bottom":
-        return Border(bottom=side)
-    return Border()
-
-def _style_header(ws, row: int, n_cols: int, bg=INDIGO, fg=WHITE):
-    for c in range(1, n_cols + 1):
-        cell = ws.cell(row=row, column=c)
-        cell.font      = _font(bold=True, color=fg)
-        cell.fill      = _fill(bg)
-        cell.alignment = _align()
-        cell.border    = _border()
-
-def _style_data_rows(ws, start_row: int, end_row: int, n_cols: int):
-    for r in range(start_row, end_row + 1):
-        bg = GRAY if r % 2 == 0 else WHITE
-        for c in range(1, n_cols + 1):
-            cell = ws.cell(row=r, column=c)
-            cell.fill      = _fill(bg)
-            cell.border    = _border(sides="bottom", style="hair")
-            cell.alignment = _align(h="left", v="center")
-
-def _autofit(ws, min_w=8, max_w=40):
-    for col_cells in ws.columns:
-        length = max(
-            len(str(cell.value or "")) for cell in col_cells
-        )
-        ws.column_dimensions[get_column_letter(col_cells[0].column)].width = (
-            min(max(length + 2, min_w), max_w)
-        )
-
-
-# ── Feuille Synthèse ──────────────────────────────────────────────────────────
-def _add_summary_sheet(wb, df, analysis):
-    ws = wb.active
-    ws.title = "Synthèse"
-    ws.sheet_view.showGridLines = False
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 20
-
-    # Titre principal
-    ws.merge_cells("A1:D1")
-    ws["A1"] = "RAPPORT D'ANALYSE — DataLens"
-    ws["A1"].font      = _font(bold=True, size=16, color=INDIGO)
-    ws["A1"].alignment = _align(h="left")
-    ws["A2"] = f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
-    ws["A2"].font      = _font(size=10, color=GRAY_DARK)
-    ws.row_dimensions[1].height = 30
-
-    ws.append([])  # ligne vide
-
-    # Métriques clés
-    metrics = [
-        ("📋 Nombre de lignes",       f"{len(df):,}"),
-        ("📐 Nombre de colonnes",      str(len(df.columns))),
-        ("🔢 Colonnes numériques",     str(len(analysis.get("num_cols", [])))),
-        ("🗂️ Colonnes catégorielles",  str(len(analysis.get("cat_cols", [])))),
-        ("📅 Colonnes date",           str(len(analysis.get("date_cols", [])))),
-        ("⚠️ Anomalies détectées",     str(analysis.get("anomaly_count", "N/A"))),
-    ]
-    ws.append(["Indicateur", "Valeur"])
-    _style_header(ws, ws.max_row, 2)
-
-    for label, val in metrics:
-        ws.append([label, val])
-    _style_data_rows(ws, ws.max_row - len(metrics) + 1, ws.max_row, 2)
-
-    ws.append([])
-
-    # Top corrélations
-    top_corr = analysis.get("top_correlations")
-    if top_corr is not None and not top_corr.empty:
-        ws.append(["Top corrélations"])
-        ws[f"A{ws.max_row}"].font = _font(bold=True, size=12, color=INDIGO)
-        ws.append(["Colonne A", "Colonne B", "Corrélation (Pearson)"])
-        _style_header(ws, ws.max_row, 3, bg="6366F1")
-        for _, row in top_corr.head(5).iterrows():
-            ws.append([row["col_a"], row["col_b"], round(row["correlation"], 4)])
-        _style_data_rows(ws, ws.max_row - 4, ws.max_row, 3)
-
-
-# ── Feuille Données nettoyées ─────────────────────────────────────────────────
-def _add_data_sheet(wb, df):
-    ws = wb.create_sheet("Données")
-    ws.sheet_view.showGridLines = False
-
-    for r in dataframe_to_rows(df, index=False, header=True):
-        ws.append(r)
-
-    _style_header(ws, 1, len(df.columns))
-    _style_data_rows(ws, 2, len(df) + 1, len(df.columns))
-    _autofit(ws)
-
-    # Freeze pane (header fixe)
-    ws.freeze_panes = "A2"
-
-
-# ── Feuille KPIs ──────────────────────────────────────────────────────────────
-def _add_kpi_sheet(wb, kpis: dict):
-    if not kpis:
-        return
-    ws = wb.create_sheet("KPIs")
-    ws.sheet_view.showGridLines = False
-
-    headers = ["Colonne", "Moyenne", "Médiane", "Écart-type",
-               "Min", "Max", "Q1", "Q3", "IQR", "Skewness", "Kurtosis"]
-    ws.append(headers)
-    _style_header(ws, 1, len(headers), bg="059669")
-
-    for col_name, vals in kpis.items():
-        ws.append([
-            col_name,
-            vals.get("moyenne"),
-            vals.get("médiane"),
-            vals.get("écart-type"),
-            vals.get("min"),
-            vals.get("max"),
-            vals.get("q1"),
-            vals.get("q3"),
-            vals.get("iqr"),
-            vals.get("skewness"),
-            vals.get("kurtosis"),
-        ])
-
-    _style_data_rows(ws, 2, ws.max_row, len(headers))
-
-    # Format numérique
-    for row in ws.iter_rows(min_row=2, min_col=2):
-        for cell in row:
-            if isinstance(cell.value, (int, float)):
-                cell.number_format = "#,##0.0000"
-
-    _autofit(ws)
-
-
-# ── Feuille Corrélations ───────────────────────────────────────────────────────
-def _add_corr_sheet(wb, corr_matrix: pd.DataFrame):
-    ws = wb.create_sheet("Corrélations")
-    ws.sheet_view.showGridLines = False
-
-    cols = corr_matrix.columns.tolist()
-    ws.append([""] + cols)
-    _style_header(ws, 1, len(cols) + 1, bg="7C3AED")
-
-    for idx_name, row_data in corr_matrix.iterrows():
-        ws.append([idx_name] + [round(v, 4) for v in row_data.values])
-
-    # Colorisation conditionnelle manuelle
-    for r in range(2, len(cols) + 2):
-        for c in range(2, len(cols) + 2):
-            cell = ws.cell(row=r, column=c)
-            val  = cell.value or 0
-            if val is None:
-                continue
-            if val >= 0.7:
-                cell.fill = _fill("BBDEFB")
-                cell.font = _font(color="0D47A1")
-            elif val >= 0.4:
-                cell.fill = _fill("E3F2FD")
-            elif val <= -0.7:
-                cell.fill = _fill("FFCDD2")
-                cell.font = _font(color="B71C1C")
-            elif val <= -0.4:
-                cell.fill = _fill("FFEBEE")
-            cell.number_format = "0.00"
-            cell.alignment = _align()
-
-    _autofit(ws, max_w=16)
-
-
-# ── Feuilles Graphiques ────────────────────────────────────────────────────────
-def _add_chart_sheet(wb, df: pd.DataFrame, col: str, chart_idx: int):
-    safe_name = f"Graph {chart_idx} - {col[:18]}"
-    ws = wb.create_sheet(safe_name)
-    ws.sheet_view.showGridLines = False
-
-    # Données source
-    ws["A1"] = "Index"
-    ws["B1"] = col
-    _style_header(ws, 1, 2)
-
-    series = df[col].dropna().reset_index(drop=True)
-    for i, val in enumerate(series, 2):
-        ws.cell(row=i, column=1, value=i - 1)
-        ws.cell(row=i, column=2, value=round(float(val), 4))
-
-    n_rows = len(series) + 1
-
-    # Graphique en courbe
-    chart = LineChart()
-    chart.title       = f"Évolution — {col}"
-    chart.style       = 10
-    chart.y_axis.title = col
-    chart.x_axis.title = "Index"
-    chart.height       = 14
-    chart.width        = 26
-
-    data = Reference(ws, min_col=2, min_row=1, max_row=n_rows)
-    cats = Reference(ws, min_col=1, min_row=2, max_row=n_rows)
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(cats)
-    chart.series[0].graphicalProperties.line.solidFill = INDIGO
-    chart.series[0].graphicalProperties.line.width     = 20000
-
-    ws.add_chart(chart, "D2")
-
-
-# ── Feuille Anomalies ──────────────────────────────────────────────────────────
-def _add_anomaly_sheet(wb, anomaly_df: pd.DataFrame):
-    if anomaly_df.empty:
-        return
-    ws = wb.create_sheet("Anomalies")
-    ws.sheet_view.showGridLines = False
-
-    ws["A1"] = f"⚠️ {len(anomaly_df)} anomalies détectées"
-    ws["A1"].font = _font(bold=True, size=13, color=RED)
-    ws.append([])
-
-    cols = anomaly_df.columns.tolist()
-    ws.append(cols)
-    _style_header(ws, ws.max_row, len(cols), bg=RED)
-
-    for _, row in anomaly_df.iterrows():
-        ws.append(row.tolist())
-
-    _style_data_rows(ws, ws.max_row - len(anomaly_df) + 1, ws.max_row, len(cols))
-    _autofit(ws)
-
-
-# ── Export principal ───────────────────────────────────────────────────────────
-def export_to_excel(df: pd.DataFrame, analysis: dict, max_charts: int = 5) -> bytes:
-    wb = openpyxl.Workbook()
-
-    _add_summary_sheet(wb, df, analysis)
-    _add_data_sheet(wb, df)
-
-    if analysis.get("kpis"):
-        _add_kpi_sheet(wb, analysis["kpis"])
-
-    if "corr_matrix" in analysis:
-        _add_corr_sheet(wb, analysis["corr_matrix"])
-
-    num_cols = analysis.get("num_cols", [])
-    for i, col in enumerate(num_cols[:max_charts], 1):
-        _add_chart_sheet(wb, df, col, i)
-
-    anomaly_df = analysis.get("anomaly_rows", pd.DataFrame())
-    if not anomaly_df.empty:
-        _add_anomaly_sheet(wb, anomaly_df)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-# 🔍 DataLens — Analyse automatique de données
-
-Application Streamlit pour importer, analyser et exporter des jeux de données en quelques clics.
-
-## 🚀 Installation rapide
-
-### 1. Prérequis
-- Python 3.10+ installé ([python.org](https://www.python.org/downloads/))
-
-### 2. Installer les dépendances
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Lancer l'application
-
-```bash
-streamlit run app.py
-```
-
-L'app s'ouvre automatiquement sur **http://localhost:8501**
-
----
-
-## 📁 Structure du projet
-
-```
-datalens/
-├── app.py           → Interface principale Streamlit
-├── data_loader.py   → Import & nettoyage des fichiers
-├── analyzer.py      → Moteur d'analyse statistique
-├── dashboard.py     → Visualisations Plotly
-├── exporter.py      → Export Excel multi-feuilles
-└── requirements.txt → Dépendances Python
-```
-
-## 📊 Formats supportés
-
-| Format | Extension |
-|--------|-----------|
-| Excel  | .xlsx, .xls |
-| CSV    | .csv, .tsv |
-| JSON   | .json |
-| Parquet | .parquet |
-
-## ✨ Fonctionnalités
-
-- **Import intelligent** : détection auto des types (dates, nombres, catégories)
-- **Nettoyage auto** : doublons, valeurs nulles, normalisation
-- **Statistiques** : descriptives, corrélations, skewness, kurtosis
-- **Anomalies** : Isolation Forest avec score de confiance
-- **Tendances** : séries temporelles avec resampling mensuel
-- **Dashboard interactif** : 6 onglets de visualisations Plotly
-- **Export Excel** : rapport multi-feuilles avec graphiques natifs
-
-## 🛠️ Options disponibles (sidebar)
-
-- Activer/désactiver chaque module d'analyse
-- Ajuster le seuil de détection d'anomalies (1–20%)
-- Contrôler le nombre de feuilles graphiques dans l'export
-
----
-
-*DataLens v1.0 — Propulsé par Streamlit, Pandas & Plotly*
-streamlit>=1.35.0
-pandas>=2.2.0
-numpy>=1.26.0
-plotly>=5.22.0
-scipy>=1.13.0
-scikit-learn>=1.5.0
-openpyxl>=3.1.0
-pyarrow>=16.0.0
-statsmodels>=0.14.0
-
+ 
+function pearson(x,y){
+  const n=Math.min(x.length,y.length);if(n<2)return 0
+  const mx=x.reduce((a,v)=>a+v,0)/n,my=y.reduce((a,v)=>a+v,0)/n
+  const num=x.reduce((a,v,i)=>a+(v-mx)*(y[i]-my),0)
+  const den=Math.sqrt(x.reduce((a,v)=>a+(v-mx)**2,0)*y.reduce((a,v)=>a+(v-my)**2,0))
+  return den?+(num/den).toFixed(3):0
+}
+ 
+function colType(vals){
+  const ok=vals.filter(v=>v!=null&&v!=='')
+  if(!ok.length)return'text'
+  const n=ok.filter(v=>isFinite(Number(String(v).replace(/[\s]/g,'').replace(',','.')))).length
+  return n/ok.length>.85?'number':'text'
+}
+ 
+function makeHist(vals,bins=22){
+  const nums=vals.filter(v=>typeof v==='number'&&isFinite(v))
+  if(!nums.length)return[]
+  const mn=Math.min(...nums),mx=Math.max(...nums),w=(mx-mn)/bins||1
+  const b=Array.from({length:bins},(_,i)=>({x:+(mn+i*w).toFixed(3),n:0}))
+  nums.forEach(v=>{b[Math.min(Math.floor((v-mn)/w),bins-1)].n++})
+  return b
+}
+ 
+function parseFile(file,onOk,onErr){
+  const ext=file.name.split('.').pop().toLowerCase()
+  const process=raw=>{
+    if(!raw.length)return onErr('Fichier vide')
+    const keys=Object.keys(raw[0])
+    const cols=keys.map(name=>({name,type:colType(raw.map(r=>r[name]))}))
+    const rows=raw.map(r=>{
+      const out={}
+      cols.forEach(({name,type})=>{
+        if(type==='number'){const v=parseFloat(String(r[name]||'').replace(/\s/g,'').replace(',','.'));out[name]=isFinite(v)?v:null}
+        else out[name]=r[name]==null?'':String(r[name])
+      })
+      return out
+    })
+    onOk({cols,rows})
+  }
+  if(['csv','tsv'].includes(ext)){
+    Papa.parse(file,{header:true,skipEmptyLines:true,delimiter:ext==='tsv'?'\t':undefined,complete:r=>process(r.data),error:e=>onErr(e.message)})
+  }else if(['xlsx','xls'].includes(ext)){
+    const rd=new FileReader()
+    rd.onload=e=>{try{const wb=XLSX.read(e.target.result,{type:'binary'});process(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]))}catch(e){onErr(e.message)}}
+    rd.onerror=()=>onErr('Erreur de lecture')
+    rd.readAsBinaryString(file)
+  }else onErr('Format non supporté. Utilise CSV, TSV ou Excel (.xlsx/.xls)')
+}
+ 
+function runAnalysis(df){
+  const numC=df.cols.filter(c=>c.type==='number').map(c=>c.name)
+  const catC=df.cols.filter(c=>c.type==='text').map(c=>c.name)
+  const numSt=numC.map(col=>({col,...calcStats(df.rows.map(r=>r[col]))})).filter(s=>s&&s.n)
+  const corr=numC.length>=2?numC.map((a,i)=>numC.map((b,j)=>{if(i===j)return 1;const p=df.rows.filter(r=>r[a]!=null&&r[b]!=null);return pearson(p.map(r=>r[a]),p.map(r=>r[b]))})):[]
+  const catF={}
+  catC.forEach(col=>{const f={};df.rows.forEach(r=>{const v=String(r[col]||'');f[v]=(f[v]||0)+1});catF[col]=Object.entries(f).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([label,count])=>({label,count}))})
+  const anom=new Set()
+  numSt.forEach(({col,q1,q3,iqr})=>{const lo=q1-1.5*iqr,hi=q3+1.5*iqr;df.rows.forEach((r,i)=>{if(r[col]!=null&&(r[col]<lo||r[col]>hi))anom.add(i)})})
+  return{numC,catC,numSt,corr,catF,anom}
+}
+ 
+function doExport(df,an){
+  const wb=XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([["DataLens — Rapport d'analyse"],["Généré le",new Date().toLocaleString('fr-FR')],[],["Lignes",df.rows.length],["Colonnes",df.cols.length],["Colonnes numériques",an.numC.length],["Anomalies IQR",an.anom.size]]),'Synthèse')
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(df.rows),'Données')
+  if(an.numSt.length)XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(an.numSt.map(s=>({Colonne:s.col,Moyenne:+s.mean.toFixed(4),Médiane:+s.med.toFixed(4),'Écart-type':+s.std.toFixed(4),Min:s.min,Max:s.max,Q1:+s.q1.toFixed(4),Q3:+s.q3.toFixed(4),IQR:+s.iqr.toFixed(4),Skewness:+s.skew.toFixed(4)}))),'KPIs')
+  if(an.corr.length)XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([['', ...an.numC],...an.corr.map((r,i)=>[an.numC[i],...r])]),'Corrélations')
+  if(an.anom.size)XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(df.rows.filter((_,i)=>an.anom.has(i))),'Anomalies')
+  XLSX.writeFile(wb,'datalens_rapport.xlsx')
+}
+ 
+function Heatmap({matrix,labels}){
+  const n=labels.length,cell=Math.max(34,Math.min(60,Math.floor(440/n))),lw=92,lh=46,W=lw+cell*n,H=lh+cell*n
+  const col=v=>v>=0?`rgba(99,102,241,${Math.abs(v)*.85+.1})`:`rgba(239,68,68,${Math.abs(v)*.85+.1})`
+  return h('svg',{width:'100%',viewBox:`0 0 ${W} ${H}`,style:{maxWidth:W}},
+    labels.map((l,i)=>h('text',{key:'r'+i,x:lw-5,y:lh+i*cell+cell/2,textAnchor:'end',fontSize:Math.min(11,cell*.36),fill:'#6b7280',dominantBaseline:'central'},l.length>13?l.slice(0,13)+'…':l)),
+    labels.map((l,j)=>h('text',{key:'c'+j,x:lw+j*cell+cell/2,y:lh-6,textAnchor:'middle',fontSize:Math.min(11,cell*.36),fill:'#6b7280',transform:`rotate(-35,${lw+j*cell+cell/2},${lh-6})`},l.length>11?l.slice(0,11)+'…':l)),
+    matrix.map((row,i)=>row.map((v,j)=>h('g',{key:`${i}-${j}`},
+      h('rect',{x:lw+j*cell,y:lh+i*cell,width:cell-2,height:cell-2,rx:3,fill:col(v)}),
+      cell>40&&h('text',{x:lw+j*cell+cell/2,y:lh+i*cell+cell/2,textAnchor:'middle',dominantBaseline:'central',fontSize:Math.min(10,cell*.29),fill:Math.abs(v)>.55?'#fff':'#1e1b4b'},v.toFixed(2))
+    )))
+  )
+}
+ 
+function App(){
+  const [df,setDf]=useState(null),[an,setAn]=useState(null),[tab,setTab]=useState('kpis')
+  const [busy,setBusy]=useState(false),[err,setErr]=useState(''),[drag,setDrag]=useState(false)
+  const [nSel,setNSel]=useState(null),[cSel,setCSel]=useState(null)
+  const [aiTxt,setAiTxt]=useState(''),[aiLoad,setAiLoad]=useState(false)
+  const ref=useRef()
+ 
+  const load=useCallback(file=>{
+    if(!file)return
+    setBusy(true);setErr('');setDf(null);setAn(null);setAiTxt('')
+    parseFile(file,data=>{
+      const a=runAnalysis(data);setDf(data);setAn(a)
+      setNSel(data.cols.find(c=>c.type==='number')?.name||null)
+      setCSel(data.cols.find(c=>c.type==='text')?.name||null)
+      setTab('kpis');setBusy(false)
+    },msg=>{setErr(msg);setBusy(false)})
+  },[])
+ 
+  const onDrop=e=>{e.preventDefault();setDrag(false);load(e.dataTransfer.files[0])}
+ 
+  async function genAI(){
+    if(!an||!df)return
+    setAiLoad(true);setAiTxt('')
+    try{
+      const pairs=[]
+      an.numC.forEach((a,i)=>an.numC.forEach((b,j)=>{if(j>i)pairs.push({a,b,r:an.corr[i][j]})}))
+      const payload={rows:df.rows.length,cols:df.cols.length,numCols:an.numC,catCols:an.catC,anomalies:an.anom.size,
+        kpis:an.numSt.map(s=>({col:s.col,mean:+s.mean.toFixed(3),std:+s.std.toFixed(3),min:s.min,max:s.max,skew:+s.skew.toFixed(3)})),
+        topCorr:pairs.sort((x,y)=>Math.abs(y.r)-Math.abs(x.r)).slice(0,5)}
+      const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,
+          system:"Tu es expert data analyst. Génère une synthèse (~8 phrases) en français du dataset : tendances, corrélations notables, anomalies, 2-3 recommandations concrètes. Sois direct, utilise les chiffres.",
+          messages:[{role:'user',content:JSON.stringify(payload)}]})})
+      const d=await res.json()
+      setAiTxt(d.content?.[0]?.text||'Analyse indisponible.')
+    }catch{setAiTxt('Erreur de connexion. Vérifie ta connexion internet.')}
+    setAiLoad(false)
+  }
+ 
+  const TABS=df?[
+    {id:'kpis',l:'🏁 KPIs'},{id:'dist',l:'📊 Distributions'},{id:'corr',l:'🔗 Corrélations'},
+    {id:'cat',l:'🗂️ Catégories'},{id:'anom',l:`⚠️ Anomalies${an?.anom.size?` (${an.anom.size})`:''}`},
+    {id:'data',l:'📋 Données'},{id:'ai',l:'🤖 Analyse IA'}
+  ]:[]
+ 
+  return h('div',{style:{minHeight:'100vh',background:'#f8f9fc'}},
+    // ── Header
+    h('div',{style:{background:'#1e1b4b',padding:'15px 24px',display:'flex',alignItems:'center',justifyContent:'space-between',gap:10,flexWrap:'wrap',boxShadow:'0 2px 12px rgba(0,0,0,.18)'}},
+      h('div',null,
+        h('div',{style:{color:'#fff',fontWeight:700,fontSize:20,letterSpacing:'-.02em'}},'🔍 DataLens'),
+        h('div',{style:{color:'rgba(255,255,255,.42)',fontSize:11.5,marginTop:1}},'Import · Analyse · Dashboard · Export Excel')
+      ),
+      h('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},
+        h('button',{className:'btn-ghost',onClick:()=>ref.current?.click()},`📂 ${df?'Changer de fichier':'Importer un fichier'}`),
+        df&&an&&h('button',{className:'btn-green',onClick:()=>doExport(df,an)},'⬇️ Export Excel')
+      )
+    ),
+    h('input',{ref,type:'file',accept:'.csv,.tsv,.xlsx,.xls',style:{display:'none'},onChange:e=>load(e.target.files[0])}),
+ 
+    h('div',{style:{padding:'22px 24px',maxWidth:1200,margin:'0 auto'}},
+ 
+      // ── Upload
+      !df&&!busy&&h('div',{
+        className:`upload-zone${drag?' drag':''}`,
+        onDrop,onDragOver:e=>{e.preventDefault();setDrag(true)},onDragLeave:()=>setDrag(false),
+        onClick:()=>ref.current?.click()
+      },
+        h('div',{style:{fontSize:52}},'📊'),
+        h('p',{style:{fontWeight:700,fontSize:20,margin:'16px 0 7px',color:'#1e1b4b'}},'Dépose ton fichier ici'),
+        h('p',{style:{color:'#6b7280',fontSize:14}},'CSV · TSV · Excel (.xlsx / .xls) — jusqu\'à 50 MB'),
+        h('p',{style:{color:'#a5b4fc',fontSize:13,marginTop:14}},'ou clique pour parcourir'),
+        err&&h('div',{style:{marginTop:18,background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,padding:'10px 16px',color:'#b91c1c',fontSize:13}},'❌ '+err)
+      ),
+ 
+      // ── Loading
+      busy&&h('div',{style:{textAlign:'center',padding:'80px 0'}},
+        h('div',{style:{fontSize:40,display:'inline-block',animation:'spin 1.2s linear infinite'}},'⏳'),
+        h('p',{style:{fontWeight:500,marginTop:16,color:'#374151',fontSize:15}},'Chargement et analyse en cours…'),
+        h('style',null,'@keyframes spin{to{transform:rotate(360deg)}}')
+      ),
+ 
+      // ── Dashboard
+      df&&an&&h('div',null,
+ 
+        // Meta strip
+        h('div',{style:{display:'flex',gap:10,marginBottom:20,flexWrap:'wrap'}},
+          [{l:'Lignes',v:df.rows.length.toLocaleString('fr-FR'),c:IND},{l:'Colonnes',v:df.cols.length,c:'#0891b2'},
+           {l:'Numériques',v:an.numC.length,c:'#059669'},{l:'Catégorielles',v:an.catC.length,c:'#7c3aed'},
+           {l:'Anomalies',v:an.anom.size,c:an.anom.size?'#dc2626':'#059669'}]
+          .map(m=>h('div',{key:m.l,className:'meta-card'},
+            h('div',{style:{fontSize:21,fontWeight:700,color:m.c}},m.v),
+            h('div',{style:{fontSize:11,color:'#6b7280',marginTop:2}},m.l)
+          ))
+        ),
+ 
+        // Tabs
+        h('div',{style:{background:'#fff',borderRadius:10,boxShadow:'0 1px 4px rgba(0,0,0,.07)',marginBottom:18}},
+          h('div',{style:{display:'flex',gap:0,borderBottom:'1px solid rgba(0,0,0,.08)',overflowX:'auto',padding:'0 8px'}},
+            TABS.map(t=>h('button',{key:t.id,className:`tab-btn${tab===t.id?' active':''}`,onClick:()=>setTab(t.id)},t.l))
+          ),
+ 
+          h('div',{style:{padding:'20px'}},
+ 
+            // ── KPIs
+            tab==='kpis'&&(!an.numSt.length?h('p',{style:{color:'#6b7280'}},'Aucune colonne numérique détectée.'):h('div',null,
+              h('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(168px,1fr))',gap:12,marginBottom:24}},
+                an.numSt.map((s,i)=>h('div',{key:s.col,className:'card',style:{borderLeft:`4px solid ${PAL[i%PAL.length]}`}},
+                  h('div',{style:{fontSize:11,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:4,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},s.col),
+                  h('div',{style:{fontSize:24,fontWeight:700,color:PAL[i%PAL.length]}},fmtN(s.mean,2)),
+                  h('div',{style:{fontSize:11.5,color:'#6b7280',marginTop:3}},'σ = '+fmtN(s.std,2)+' · mdn '+fmtN(s.med,2))
+                ))
+              ),
+              h('div',{className:'section-title'},'Tableau statistique complet'),
+              h('div',{style:{overflowX:'auto',borderRadius:8,border:'1px solid rgba(0,0,0,.07)'}},
+                h('table',null,
+                  h('thead',null,h('tr',null,['Colonne','Moy.','Méd.','σ','Min','Max','Q1','Q3','IQR','Skew','n'].map(c=>h('th',{key:c},c)))),
+                  h('tbody',null,an.numSt.map((s,i)=>h('tr',{key:s.col},
+                    h('td',{style:{fontWeight:600,color:'#1e1b4b'}},s.col),
+                    ...[s.mean,s.med,s.std,s.min,s.max,s.q1,s.q3,s.iqr,s.skew].map((v,j)=>h('td',{key:j},fmtN(v))),
+                    h('td',null,s.n.toLocaleString('fr-FR'))
+                  )))
+                )
+              )
+            )),
+ 
+            // ── Distributions
+            tab==='dist'&&(!an.numC.length?h('p',{style:{color:'#6b7280'}},'Aucune colonne numérique.'):h('div',null,
+              h('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:18,flexWrap:'wrap'}},
+                h('span',{style:{fontSize:13,fontWeight:500}},'Colonne :'),
+                h('select',{className:'std',value:nSel||'',onChange:e=>setNSel(e.target.value)},
+                  an.numC.map(c=>h('option',{key:c},c))
+                )
+              ),
+              nSel&&(()=>{
+                const s=an.numSt.find(x=>x.col===nSel),bins=makeHist(df.rows.map(r=>r[nSel]))
+                return h('div',null,
+                  h('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(115px,1fr))',gap:10,marginBottom:20}},
+                    s&&[['Moyenne',s.mean],['Médiane',s.med],['σ',s.std],['Min',s.min],['Max',s.max],['IQR',s.iqr],['Skewness',s.skew]].map(([l,v])=>
+                      h('div',{key:l,className:'stat-chip'},
+                        h('div',{style:{fontSize:18,fontWeight:700,color:IND}},fmtN(v,2)),
+                        h('div',{style:{fontSize:11,color:'#6b7280',marginTop:2}},l)
+                      )
+                    )
+                  ),
+                  h('div',{className:'section-title'},'Histogramme de distribution'),
+                  h(ResponsiveContainer,{width:'100%',height:230},
+                    h(BarChart,{data:bins,margin:{top:4,right:8,left:0,bottom:0}},
+                      h(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(0,0,0,.07)'}),
+                      h(XAxis,{dataKey:'x',tick:{fontSize:10},tickFormatter:v=>Number(v).toLocaleString('fr-FR',{maximumFractionDigits:2})}),
+                      h(YAxis,{tick:{fontSize:10}}),
+                      h(Tooltip,{formatter:v=>[v,'Fréquence']}),
+                      h(Bar,{dataKey:'n',fill:IND,radius:[3,3,0,0]})
+                    )
+                  )
+                )
+              })()
+            )),
+ 
+            // ── Corrélations
+            tab==='corr'&&(an.numC.length<2?h('p',{style:{color:'#6b7280'}},'Il faut au moins 2 colonnes numériques pour calculer les corrélations.'):h('div',null,
+              h('div',{className:'section-title'},'Heatmap des corrélations (Pearson)'),
+              h('div',{style:{overflowX:'auto',marginBottom:24}},h(Heatmap,{matrix:an.corr,labels:an.numC})),
+              h('div',{className:'section-title'},'Top corrélations'),
+              (()=>{
+                const p=[]
+                an.numC.forEach((a,i)=>an.numC.forEach((b,j)=>{if(j>i)p.push({a,b,r:an.corr[i][j]})}))
+                return p.sort((x,y)=>Math.abs(y.r)-Math.abs(x.r)).slice(0,10).map(({a,b,r})=>
+                  h('div',{key:`${a}-${b}`,className:'corr-row'},
+                    h('span',{style:{flex:1,fontSize:13,fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},`${a} × ${b}`),
+                    h('div',{className:'corr-bar-track'},h('div',{style:{width:`${Math.abs(r)*100}%`,height:'100%',background:r>0?IND:'#ef4444',borderRadius:4}})),
+                    h('span',{style:{fontWeight:700,color:Math.abs(r)>.5?(r>0?IND:'#ef4444'):'#9ca3af',minWidth:52,textAlign:'right',fontSize:13}},`${r>0?'+':''}${r.toFixed(3)}`)
+                  )
+                )
+              })()
+            )),
+ 
+            // ── Catégories
+            tab==='cat'&&(!an.catC.length?h('p',{style:{color:'#6b7280'}},'Aucune colonne catégorielle détectée.'):h('div',null,
+              h('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:18,flexWrap:'wrap'}},
+                h('span',{style:{fontSize:13,fontWeight:500}},'Colonne :'),
+                h('select',{className:'std',value:cSel||'',onChange:e=>setCSel(e.target.value)},
+                  an.catC.map(c=>h('option',{key:c},c))
+                )
+              ),
+              cSel&&an.catF[cSel]&&h(ResponsiveContainer,{width:'100%',height:Math.min(440,an.catF[cSel].length*30+40)},
+                h(BarChart,{data:an.catF[cSel],layout:'vertical',margin:{top:4,right:30,left:115,bottom:4}},
+                  h(CartesianGrid,{strokeDasharray:'3 3',stroke:'rgba(0,0,0,.07)'}),
+                  h(XAxis,{type:'number',tick:{fontSize:11}}),
+                  h(YAxis,{type:'category',dataKey:'label',tick:{fontSize:11},width:115}),
+                  h(Tooltip),
+                  h(Bar,{dataKey:'count',name:'Occurrences',radius:[0,3,3,0]},
+                    an.catF[cSel].map((_,i)=>h(Cell,{key:i,fill:PAL[i%PAL.length]}))
+                  )
+                )
+              )
+            )),
+ 
+            // ── Anomalies
+            tab==='anom'&&(!an.anom.size?
+              h('div',{style:{textAlign:'center',padding:'50px 0'}},
+                h('div',{style:{fontSize:48}},'✅'),
+                h('p',{style:{fontWeight:600,marginTop:14,fontSize:16,color:'#1e1b4b'}},'Aucune anomalie détectée'),
+                h('p',{style:{color:'#6b7280',fontSize:13,marginTop:6}},'Méthode IQR × 1.5 appliquée sur toutes les colonnes numériques')
+              ):h('div',null,
+                h('div',{className:'anom-banner'},`⚠️ ${an.anom.size} ligne${an.anom.size>1?'s':''} anormale${an.anom.size>1?'s':''} détectée${an.anom.size>1?'s':''} — méthode IQR ± 1.5 par colonne`),
+                h('div',{style:{overflowX:'auto',maxHeight:420,overflowY:'auto',borderRadius:8,border:'1px solid rgba(0,0,0,.08)'}},
+                  h('table',null,
+                    h('thead',null,h('tr',null,['#',...df.cols.slice(0,10).map(c=>c.name)].map(hd=>h('th',{key:hd,style:{background:'#dc2626'}},hd)))),
+                    h('tbody',null,df.rows.filter((_,i)=>an.anom.has(i)).slice(0,200).map((row,ri)=>
+                      h('tr',{key:ri},
+                        h('td',{style:{color:'#9ca3af'}},ri+1),
+                        df.cols.slice(0,10).map(c=>h('td',{key:c.name},row[c.name]==null?'—':String(row[c.name]).slice(0,32)))
+                      )
+                    ))
+                  )
+                )
+              )
+            ),
+ 
+            // ── Données
+            tab==='data'&&h('div',null,
+              h('div',{style:{overflowX:'auto',maxHeight:480,overflowY:'auto',borderRadius:8,border:'1px solid rgba(0,0,0,.08)'}},
+                h('table',null,
+                  h('thead',null,h('tr',null,df.cols.map(c=>h('th',{key:c.name},c.name,' ',h('span',{style:{opacity:.38,fontSize:9.5}},c.type==='number'?'🔢':'🔤'))))),
+                  h('tbody',null,df.rows.slice(0,300).map((row,i)=>h('tr',{key:i},
+                    df.cols.map(c=>h('td',{key:c.name},row[c.name]==null?h('span',{style:{color:'#d1d5db'}},'—'):String(row[c.name]).slice(0,50)))
+                  )))
+                )
+              ),
+              df.rows.length>300&&h('p',{style:{color:'#9ca3af',fontSize:12,textAlign:'center',marginTop:10}},`300 lignes affichées sur ${df.rows.length.toLocaleString('fr-FR')} au total`)
+            ),
+ 
+            // ── IA
+            tab==='ai'&&h('div',null,
+              h('p',{style:{color:'#6b7280',fontSize:14,marginBottom:18,lineHeight:1.6}},'Génère une synthèse en langage naturel de tes données grâce à Claude (connexion internet requise).'),
+              h('button',{className:'btn-primary',onClick:genAI,disabled:aiLoad},aiLoad?'⏳ Analyse en cours…':'🤖 Générer la synthèse IA'),
+              aiTxt&&h('div',{className:'ai-box',style:{marginTop:20}},
+                h('strong',{style:{display:'block',marginBottom:10,color:IND,fontSize:15}},'📊 Synthèse IA'),
+                aiTxt
+              )
+            )
+ 
+          ) // end tab content
+        ) // end tab card
+      ) // end dashboard
+    ) // end container
+  )
+}
+ 
+ReactDOM.createRoot(document.getElementById('root')).render(h(App))
+</script>
+</body>
+</html>
